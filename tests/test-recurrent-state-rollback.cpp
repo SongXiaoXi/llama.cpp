@@ -362,9 +362,12 @@ static test_status test_rollback(const common_params & params, llama_model * mod
     }
 
     // Save the rolled-back state and restore it into a fresh context.
+    common_memory mem_src, mem_dst;
+    mem_src.init(ctx_src.get(), nullptr, nullptr);
+    mem_dst.init(ctx_dst.get(), nullptr, nullptr);
     common_prompt_checkpoint ckpt;
-    ckpt.update_tgt(ctx_src.get(), 0, 0);
-    ckpt.load_tgt(ctx_dst.get(), 0, 0);
+    ckpt.update_tgt(mem_src, 0, 0);
+    GGML_ASSERT(ckpt.load_tgt(mem_dst, 0, 0));
 
     constexpr float nmse_eps = 0.0;
     std::vector<std::vector<float>> logits_src_replay(n_rollback);
@@ -414,8 +417,8 @@ static test_status test_rollback(const common_params & params, llama_model * mod
 
     //constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     //common_prompt_checkpoint ckpt_partial;
-    //ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
-    //ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
+    //ckpt_partial.update_tgt(mem_src, 0, partial_flags);
+    //GGML_ASSERT(ckpt_partial.load_tgt(mem_dst, 0, partial_flags));
 
     //if (!replay_and_compare("partial")) {
     //    return 1;
@@ -446,7 +449,9 @@ static test_status test_rollback(const common_params & params, llama_model * mod
         return test_status::FAIL;
     }
 
-    ckpt.load_tgt(ctx_dirty.get(), 0, 0);
+    common_memory mem_dirty;
+    mem_dirty.init(ctx_dirty.get(), nullptr, nullptr);
+    GGML_ASSERT(ckpt.load_tgt(mem_dirty, 0, 0));
 
     for (uint32_t i = 0; i < n_rollback; ++i) {
         const llama_pos pos = rollback_pos + i;

@@ -1708,14 +1708,14 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+bool server_prompt_cache::save(const server_prompt & prompt, const common_memory & mem, llama_seq_id seq_id) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
+            return false;
         }
     }
 
@@ -1725,13 +1725,21 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         checkpoints_size += ckpt.size();
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    common_prompt_checkpoint data = {};
+    common_speculative_get_state(mem.spec, seq_id, data.data_spec);
+
+    const size_t state_size_tgt =               llama_state_seq_get_size_ext(mem.ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t state_size_dft = mem.ctx_dft ? llama_state_seq_get_size_ext(mem.ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+    const size_t state_size_new = state_size_tgt + state_size_dft + data.data_spec.size() + checkpoints_size;
+
+    SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+            (int) prompt.tokens.size(), (state_size_new - checkpoints_size) / (1024.0 * 1024.0), state_size_dft / (1024.0 * 1024.0));
 
     // skip over-limit entries to avoid disturbing the cache
     if (limit_size > 0 && state_size_new > limit_size) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
-        return nullptr;
+        return false;
     }
 
     // remove any cached prompts that are fully contained in the current prompt
@@ -1757,13 +1765,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
-
     // check if we can allocate enough memory for the new state
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        data.update_tgt(mem, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        data.update_dft(mem.ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+
+        states.push_back({ prompt.clone(), std::move(data) });
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -1773,24 +1780,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
         update();
 
-        return nullptr;
+        return false;
     }
 
-    states.push_back({
-        /*.prompt =*/ {
-            /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
-        },
-        /*.data   =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
-        },
-    });
-
-    return &states.back();
+    return true;
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const common_memory & mem, llama_seq_id seq_id) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1825,38 +1821,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
-                return false;
-            }
-
-            data.clear();
-            data.shrink_to_fit();
-        }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
-            }
+        const auto & data = it_best->data;
+        if (!data.load_tgt(mem, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) ||
+            !data.load_dft(mem.ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE)) {
+            return false;
         }
 
         prompt = std::move(it_best->prompt);

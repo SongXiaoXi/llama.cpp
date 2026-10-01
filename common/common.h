@@ -1015,11 +1015,14 @@ enum common_context_seq_rm_type {
 // note: clears the memory of the context
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
 
+struct common_speculative;
+
 struct common_memory {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
+    common_speculative * spec = nullptr;
 
-    void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr);
+    void init(llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec);
 
     // aborts execution on failure
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
@@ -1242,8 +1245,7 @@ struct common_prompt_checkpoint {
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
-    // (optional) speculative-decoding implementation state stashed with the checkpoint
-    // (e.g. eagle3's deferred-boundary g_embd row)
+    // Speculative boundary state follows the target checkpoint, not temporary draft rollback.
     std::vector<uint8_t> data_spec;
 
     size_t size() const;
@@ -1257,7 +1259,7 @@ struct common_prompt_checkpoint {
             llama_pos pos_max);
 
     void update_tgt(
-            llama_context * ctx,
+            const common_memory & mem,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
@@ -1266,12 +1268,12 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void load_tgt(
-            llama_context * ctx,
+    bool load_tgt(
+            const common_memory & mem,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
-    void load_dft(
+    bool load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
