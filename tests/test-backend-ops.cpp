@@ -2250,6 +2250,59 @@ struct test_glu_split : public test_case {
     }
 };
 
+struct test_swiglu_mul_mat : public test_case {
+    enum layout_t {
+        LAYOUT_PACKED,
+        LAYOUT_PACKED_SWAPPED,
+        LAYOUT_SPLIT,
+        LAYOUT_SPLIT_STRIDED_UP,
+    };
+
+    const ggml_type type;
+    const int64_t k;
+    const int64_t m;
+    const int64_t n;
+    const layout_t layout;
+    const bool reuse_glu;
+
+    test_swiglu_mul_mat(ggml_type type, int64_t k, int64_t m, int64_t n, layout_t layout, bool reuse_glu = false)
+        : type(type), k(k), m(m), n(n), layout(layout), reuse_glu(reuse_glu) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, k, m, n, layout, reuse_glu);
+    }
+
+    std::string op_desc(ggml_tensor *) override {
+        return "SWIGLU_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, layout <= LAYOUT_PACKED_SWAPPED ? 2*k : k, n, 2, 2);
+        ggml_tensor * glu;
+        if (layout <= LAYOUT_PACKED_SWAPPED) {
+            glu = ggml_glu(ctx, gate, GGML_GLU_OP_SWIGLU, layout == LAYOUT_PACKED_SWAPPED);
+        } else {
+            ggml_tensor * up = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, layout == LAYOUT_SPLIT_STRIDED_UP ? 2*k : k, n, 2, 2);
+            if (layout == LAYOUT_SPLIT_STRIDED_UP) {
+                up = ggml_view_4d(ctx, up, k, n, 2, 2, up->nb[1], up->nb[2], up->nb[3], 0);
+            }
+            glu = ggml_swiglu_split(ctx, gate, up);
+        }
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * out = ggml_mul_mat(ctx, weight, glu);
+        if (reuse_glu) {
+            out = ggml_add(ctx, out, ggml_sum_rows(ctx, glu));
+        }
+        return out;
+    }
+};
+
 struct test_swiglu_oai : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -9413,6 +9466,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S}) {
+        for (auto layout : {
+            test_swiglu_mul_mat::LAYOUT_PACKED,
+            test_swiglu_mul_mat::LAYOUT_PACKED_SWAPPED,
+            test_swiglu_mul_mat::LAYOUT_SPLIT,
+            test_swiglu_mul_mat::LAYOUT_SPLIT_STRIDED_UP}) {
+            for (int64_t n : {1, 4, 65}) {
+                test_cases.emplace_back(new test_swiglu_mul_mat(type, 768, 128, n, layout));
+            }
+        }
+        test_cases.emplace_back(new test_swiglu_mul_mat(type, 768, 128, 4, test_swiglu_mul_mat::LAYOUT_SPLIT, true));
+        test_cases.emplace_back(new test_swiglu_mul_mat(type, 768, 128, 65, test_swiglu_mul_mat::LAYOUT_SPLIT, true));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

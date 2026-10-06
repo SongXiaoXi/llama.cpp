@@ -1767,6 +1767,32 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+static bool ggml_cuda_should_fuse_glu_mmq(const ggml_tensor * glu, const ggml_tensor * dst, const int cc) {
+    const ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * gate   = glu->src[0];
+    const ggml_tensor * up     = glu->src[1] ? glu->src[1] : gate;
+
+    // native FP4 has its own activation quantization path
+    const bool native_fp4 = blackwell_mma_available(cc) && (weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_NVFP4);
+
+    // a padded weight buffer gets cleared on first use; the fused path must not skip that
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_nbytes(weight) != ggml_backend_buffer_get_alloc_size(weight->buffer, weight) && weight->view_src;
+
+    // the fused quantizer reads gate/up with float4 loads and reuses the GLU output layout
+    const bool layout_ok =
+        gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        gate->nb[0] == sizeof(float) && up->nb[0] == sizeof(float) && glu->ne[0] % 4 == 0 &&
+        ggml_is_contiguous(glu) && ggml_is_contiguous_1(gate) && ggml_is_contiguous_1(up) &&
+        ggml_cuda_is_aligned(gate, sizeof(float4)) && ggml_cuda_is_aligned(up, sizeof(float4));
+
+    // only fuse where the plain dispatch would pick MMQ for this batch size
+    const bool use_mmq = !ggml_cuda_should_use_mmvq(weight->type, cc, glu->ne[1]) &&
+        ggml_cuda_should_use_mmq(weight->type, cc, glu->ne[1], /*n_experts=*/0);
+
+    return layout_ok && !native_fp4 && !bad_padding_clear && use_mmq;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -3282,6 +3308,19 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    std::initializer_list<enum ggml_op> glu_mul_mat_ops = { GGML_OP_GLU, GGML_OP_MUL_MAT };
+
+    if (is_equal(glu_mul_mat_ops, ops) && ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 1 })) {
+        const ggml_tensor * glu     = cgraph->nodes[node_idx];
+        const ggml_tensor * mul_mat = cgraph->nodes[node_idx + 1];
+
+        if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && mul_mat->src[1] == glu && mul_mat->src[2] == nullptr) {
+            int out_nodes[] = { node_idx + 1 };
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+        }
+    }
+
+
     std::initializer_list<enum ggml_op> rms_norm_mul_rope_ops          = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE };
     std::initializer_list<enum ggml_op> rms_norm_mul_rope_set_rows_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
@@ -3511,6 +3550,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // fuse SwiGLU into the Q8_1 quantization of the following MMQ multiplication
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, {})) {
+        ggml_tensor * glu = cgraph->nodes[i];
+        ggml_tensor * dst = cgraph->nodes[i + 1];
+
+        if (ggml_cuda_should_fuse_glu_mmq(glu, dst, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            // quantization reads gate/up before the matrix kernel writes dst, so their buffers may overlap
+            ggml_cuda_mul_mat_q(*cuda_ctx, dst->src[0], glu, nullptr, dst, glu);
+            return 1;
+        }
+    }
+
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
