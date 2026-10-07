@@ -1,7 +1,57 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
-template <int S_v, bool KDA, bool keep_rs_t>
+template <int n, bool aligned>
+static __device__ __forceinline__ void load_rows(float (&dst)[n], const float * src, const int lane_in_col, const int lanes_per_col) {
+    static_assert(n == 1 || n == 2 || n % 4 == 0, "unsupported row count");
+    if constexpr (aligned) {
+        if constexpr (n % 4 == 0) {
+#pragma unroll
+            for (int i = 0; i < n/4; i++) {
+                const float4 v = ((const float4 *) src)[lane_in_col*(n/4) + i];
+                dst[4*i + 0] = v.x;
+                dst[4*i + 1] = v.y;
+                dst[4*i + 2] = v.z;
+                dst[4*i + 3] = v.w;
+            }
+        } else if constexpr (n == 2) {
+            const float2 v = ((const float2 *) src)[lane_in_col];
+            dst[0] = v.x;
+            dst[1] = v.y;
+        } else {
+            dst[0] = src[lane_in_col];
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < n; r++) {
+            dst[r] = src[r * lanes_per_col + lane_in_col];
+        }
+    }
+}
+
+template <int n, bool aligned>
+static __device__ __forceinline__ void store_rows(float * dst, const float (&src)[n], const int lane_in_col, const int lanes_per_col) {
+    static_assert(n == 1 || n == 2 || n % 4 == 0, "unsupported row count");
+    if constexpr (aligned) {
+        if constexpr (n % 4 == 0) {
+#pragma unroll
+            for (int i = 0; i < n/4; i++) {
+                ((float4 *) dst)[lane_in_col*(n/4) + i] = make_float4(src[4*i], src[4*i + 1], src[4*i + 2], src[4*i + 3]);
+            }
+        } else if constexpr (n == 2) {
+            ((float2 *) dst)[lane_in_col] = make_float2(src[0], src[1]);
+        } else {
+            dst[lane_in_col] = src[0];
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < n; r++) {
+            dst[r * lanes_per_col + lane_in_col] = src[r];
+        }
+    }
+}
+
+template <int S_v, bool KDA, bool keep_rs_t, bool aligned = false>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -56,36 +106,30 @@ gated_delta_net_cuda(const float * q,
     curr_state += state_in_offset + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
 
-    float         s_shard[rows_per_lane];
+    alignas(16) float s_shard[rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
     ggml_cuda_pdl_sync();
-#pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        const int i = r * lanes_per_col + lane_in_col;
-        s_shard[r]  = curr_state[i];
-    }
+    load_rows<rows_per_lane, aligned>(s_shard, curr_state, lane_in_col, lanes_per_col);
+
+    int64_t qk_offset = iq3 * sq3 + iq1 * sq1;
+    int64_t v_offset  = sequence * sv3 + h_idx * sv1;
+    int64_t gb_offset = sequence * sb3 + h_idx * sb1;
 
     for (int t = 0; t < n_tokens; t++) {
-        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
-
-        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+        const float * q_t = q + qk_offset;
+        const float * k_t = k + qk_offset;
+        const float * v_t = v + v_offset;
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
         const float beta_val = *beta_t;
 
         // Cache k and q in registers
-        float k_reg[rows_per_lane];
-        float q_reg[rows_per_lane];
-#pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i = r * lanes_per_col + lane_in_col;
-            k_reg[r] = k_t[i];
-            q_reg[r] = q_t[i];
-        }
+        alignas(16) float k_reg[rows_per_lane];
+        alignas(16) float q_reg[rows_per_lane];
+        load_rows<rows_per_lane, aligned>(k_reg, k_t, lane_in_col, lanes_per_col);
+        load_rows<rows_per_lane, aligned>(q_reg, q_t, lane_in_col, lanes_per_col);
 
         if constexpr (!KDA) {
             const float g_val = expf(*g_t);
@@ -117,11 +161,14 @@ gated_delta_net_cuda(const float * q,
             }
         } else {
             // kv[col] = sum_i g[i] * S[i][col] * k[i]
+            alignas(16) float g_reg[rows_per_lane];
+            if constexpr (aligned) {
+                load_rows<rows_per_lane, true>(g_reg, g_t, lane_in_col, lanes_per_col);
+            }
             float kv_shard = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * lanes_per_col + lane_in_col;
-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
+                kv_shard += expf(aligned ? g_reg[r] : g_t[r * lanes_per_col + lane_in_col]) * s_shard[r] * k_reg[r];
             }
 
             float kv_col = warp_reduce_sum<lanes_per_col>(kv_shard);
@@ -134,8 +181,7 @@ gated_delta_net_cuda(const float * q,
             float attn_partial = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * lanes_per_col + lane_in_col;
-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]  = expf(aligned ? g_reg[r] : g_t[r * lanes_per_col + lane_in_col]) * s_shard[r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
@@ -147,6 +193,9 @@ gated_delta_net_cuda(const float * q,
         }
 
         attn_data += S_v * H;
+        qk_offset += sq2;
+        v_offset  += sv2;
+        gb_offset += sb2;
 
         if constexpr (keep_rs_t) {
             // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
@@ -154,22 +203,26 @@ gated_delta_net_cuda(const float * q,
             const int target_slot = (int) n_tokens - 1 - t;
             if (target_slot >= 0 && target_slot < K) {
                 float * curr_state = state + target_slot * state_slot_stride;
-#pragma unroll
-                for (int r = 0; r < rows_per_lane; r++) {
-                    const int i = r * lanes_per_col + lane_in_col;
-                    curr_state[col * S_v + i] = s_shard[r];
-                }
+                store_rows<rows_per_lane, aligned>(curr_state + col * S_v, s_shard, lane_in_col, lanes_per_col);
             }
         }
     }
 
     if constexpr (!keep_rs_t) {
-#pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i          = r * lanes_per_col + lane_in_col;
-            state[col * S_v + i] = s_shard[r];
-        }
+        store_rows<rows_per_lane, aligned>(state + col * S_v, s_shard, lane_in_col, lanes_per_col);
     }
+}
+
+template <int S_v, bool KDA, bool keep_rs_t>
+static void launch_gdn(const bool aligned, const ggml_cuda_kernel_launch_params & launch_params,
+        const float * q_d, const float * k_d, const float * v_d, const float * g_d, const float * b_d, const float * s_d,
+        float * dst_d, float * state_d, int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3, const uint3 neqk1_magic, const uint3 rq3_magic,
+        float scale, int64_t state_slot_stride, int K) {
+    auto kernel = aligned ? gated_delta_net_cuda<S_v, KDA, keep_rs_t, true> : gated_delta_net_cuda<S_v, KDA, keep_rs_t, false>;
+    ggml_cuda_kernel_launch(kernel, launch_params, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
 }
 
 template <bool KDA, bool keep_rs_t>
@@ -185,7 +238,16 @@ static void launch_gated_delta_net(
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    // two columns per warp (see the kernel); shrink the CTA when 4 warps per CTA would leave
+    // vector loads/stores use float4 (rows_per_lane % 4 == 0) or float2 (rows_per_lane == 2);
+    // every pointer and stride must be aligned to that width, else the stock scalar path runs
+    const int rpl_rt = S_v / ((warp_size <= S_v ? warp_size : S_v) / 2);
+    const size_t alignment = rpl_rt % 4 == 0 ? sizeof(float4) : sizeof(float2);
+    // the vectorized path pays off in the token loop; a single-token call is launch/latency
+    // bound and slightly faster on the stock scalar path, so keep it there
+    const bool aligned = n_tokens > 1 && ((uintptr_t(q_d) | uintptr_t(k_d) | uintptr_t(s_d) | uintptr_t(state_d) |
+        ((sq1 | sq2 | sq3 | state_slot_stride) * sizeof(float)) | (KDA ? uintptr_t(g_d) : 0)) & (alignment - 1)) == 0;
+
+    // two columns per warp (see the kernel); shrink the CTA when the wider CTA would leave
     // SMs without a CTA, so small head counts keep the device filled
     const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     int num_warps = 4;
@@ -202,26 +264,26 @@ static void launch_gated_delta_net(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {
         case 16:
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
+            launch_gdn<16, KDA, keep_rs_t>(aligned, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         case 32:
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
+            launch_gdn<32, KDA, keep_rs_t>(aligned, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         case 64: {
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
+            launch_gdn<64, KDA, keep_rs_t>(aligned, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         }
         case 128: {
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+            launch_gdn<128, KDA, keep_rs_t>(aligned, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
