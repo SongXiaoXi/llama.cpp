@@ -1245,6 +1245,12 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
+// Split the J range of the stream-k fixup across blockIdx.z for more CTAs; every (i, j) is still
+// owned by exactly one CTA, so the per-partial-sum accumulation order is unchanged.
+static constexpr __host__ __device__ int ggml_cuda_mmq_fixup_j_split(const int J, const int nwarps) {
+    return J >= 64 && (J/4) % nwarps == 0 ? 4 : (J >= 32 && (J/2) % nwarps == 0 ? 2 : 1);
+}
+
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
@@ -1259,8 +1265,13 @@ static __global__ void mul_mat_q_stream_k_fixup(
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback, prec_src1);
     constexpr int blocks_per_iter = ITER_K / qk;
 
-    float sum[J / nwarps] = {0.0f};
+    constexpr int J_SPLIT = ggml_cuda_mmq_fixup_j_split(J, nwarps);
+    constexpr int J_CTA   = J / J_SPLIT;
+    static_assert(J_CTA % nwarps == 0, "bad fixup J split");
+
+    float sum[J_CTA / nwarps] = {0.0f};
     const int i = blockIdx.y*warp_size + threadIdx.x;
+    const int j_cta0 = blockIdx.z * J_CTA;
 
     const int nty = (nrows_x + I - 1) / I;
 
@@ -1300,8 +1311,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
 
 
 #pragma unroll
-        for (int j0 = 0; j0 < J; j0 += nwarps) {
-            const int j = j0 + threadIdx.y;
+        for (int j0 = 0; j0 < J_CTA; j0 += nwarps) {
+            const int j = j_cta0 + j0 + threadIdx.y;
 
             sum[j0/nwarps] += tmp_last_tile[bidx*(J*I) + j*I + i];
         }
@@ -1340,8 +1351,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
         }
 
 #pragma unroll
-        for (int j0 = 0; j0 < J; j0 += nwarps) {
-            const int j = j0 + threadIdx.y;
+        for (int j0 = 0; j0 < J_CTA; j0 += nwarps) {
+            const int j = j_cta0 + j0 + threadIdx.y;
 
             if (j > j_max) {
                 return;
@@ -1357,8 +1368,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const int col_high = expert_bounds[zt + 1];
     const int col_diff = col_high - col_low;
 
-    for (int j = threadIdx.y*warp_size + threadIdx.x; j < J; j += nwarps*warp_size) {
-        ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+    for (int j = threadIdx.y*warp_size + threadIdx.x; j < J_CTA; j += nwarps*warp_size) {
+        ids_dst_shared[j_cta0 + j] = ids_dst[col_low + jt*J + j_cta0 + j];
     }
     __syncthreads();
 
@@ -1372,8 +1383,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += nwarps) {
-        const int j = j0 + threadIdx.y;
+    for (int j0 = 0; j0 < J_CTA; j0 += nwarps) {
+        const int j = j_cta0 + j0 + threadIdx.y;
 
         if (j > j_max) {
             return;
@@ -1461,7 +1472,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         tmp_fixup.alloc(block_nums_stream_k.x * config.J*config.I);
     }
 
-    const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
+    const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, ggml_cuda_mmq_fixup_j_split(J, block_dims.y/2));
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
     mul_mat_q<type, J, fallback, prec_src1><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
